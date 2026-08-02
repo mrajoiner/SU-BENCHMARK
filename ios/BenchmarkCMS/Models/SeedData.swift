@@ -291,6 +291,60 @@ enum SeedData {
         if changed { try? context.save() }
     }
 
+    /// Deletes every seeded object.
+    ///
+    /// `context.delete(model:)` performs a *batch* delete at the SQL layer,
+    /// which bypasses SwiftData's relationship maintenance. Because
+    /// `PostCategory.posts` declares `inverse: \Post.category`, the batch
+    /// delete trips a constraint trigger and fails with:
+    ///
+    ///     Constraint trigger violation: Batch delete failed due to
+    ///     mandatory OTO nullify inverse on Post/category
+    ///
+    /// Those failures were silently swallowed by `try?`, so the old data was
+    /// never removed and the wipe-and-reseed path retried on every launch,
+    /// spamming CoreData errors and leaving the store in a stale state.
+    ///
+    /// Fetching and deleting objects individually keeps the object graph
+    /// consistent. Relationships are explicitly severed first, and models are
+    /// deleted children-before-parents so no dangling inverse remains.
+    private static func wipeAll(context: ModelContext) {
+        let posts = (try? context.fetch(FetchDescriptor<Post>())) ?? []
+        let categories = (try? context.fetch(FetchDescriptor<PostCategory>())) ?? []
+        let bookmarks = (try? context.fetch(FetchDescriptor<Bookmark>())) ?? []
+        let internships = (try? context.fetch(FetchDescriptor<Internship>())) ?? []
+        let settings = (try? context.fetch(FetchDescriptor<SiteSettings>())) ?? []
+        let users = (try? context.fetch(FetchDescriptor<AppUser>())) ?? []
+
+        // Sever relationships before deleting so no inverse update is
+        // triggered against an already-deleted object.
+        for post in posts {
+            post.category = nil
+            post.author = nil
+        }
+        for category in categories {
+            category.posts = []
+        }
+        for internship in internships {
+            internship.author = nil
+        }
+
+        // Children first, then parents.
+        bookmarks.forEach { context.delete($0) }
+        posts.forEach { context.delete($0) }
+        internships.forEach { context.delete($0) }
+        categories.forEach { context.delete($0) }
+        settings.forEach { context.delete($0) }
+        users.forEach { context.delete($0) }
+
+        do {
+            try context.save()
+        } catch {
+            print("Seed wipe failed: \(error.localizedDescription)")
+            context.rollback()
+        }
+    }
+
     static func seedIfNeeded(context: ModelContext) {
         let existingUsers = (try? context.fetch(FetchDescriptor<AppUser>())) ?? []
         let hasCurrentSeed = existingUsers.contains { $0.username == "lealon" && $0.fullName == "Lealon Martin" }
@@ -308,11 +362,7 @@ enum SeedData {
 
         if !existingUsers.isEmpty {
             // Old demo data — wipe and reseed with the current roster.
-            try? context.delete(model: Post.self)
-            try? context.delete(model: PostCategory.self)
-            try? context.delete(model: SiteSettings.self)
-            try? context.delete(model: AppUser.self)
-            try? context.delete(model: Internship.self)
+            wipeAll(context: context)
         }
 
         // Users — four roles with granular permissions.
